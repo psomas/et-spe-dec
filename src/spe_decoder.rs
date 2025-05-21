@@ -1,8 +1,7 @@
-#![allow(unused)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+
 use libc::c_void;
-use std::ptr;
 
 #[repr(u8)]
 #[derive(Debug)]
@@ -149,7 +148,7 @@ impl Packet {
     fn get_payload(&mut self) {
         assert!(self.len >= self.hdr_len as usize + self.payload_len() as usize);
 
-        self.payload = match (self.payload_len()) {
+        self.payload = match self.payload_len() {
             1 => unsafe { *(self.buf.wrapping_add(self.hdr_len as _) as *mut u8) as _ },
             2 => unsafe { *(self.buf.wrapping_add(self.hdr_len as _) as *mut u16) as _ },
             4 => unsafe { *(self.buf.wrapping_add(self.hdr_len as _) as *mut u32) as _ },
@@ -234,7 +233,7 @@ impl Packet {
             packet.hdr_len = 2;
             packet.hdr = unsafe { *(buf.wrapping_add(1) as *mut u8) as _ };
 
-            if (packet.hdr == SPE_HEADER1_ALIGNMENT) {
+            if packet.hdr == SPE_HEADER1_ALIGNMENT {
                 panic!("fixme");
                 let alignment = 1 << ((packet.hdr & 0xf) + 1);
 

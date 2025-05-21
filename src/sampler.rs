@@ -1,32 +1,36 @@
-#![warn(unused_variables)]
+use std::{
+    ptr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
 use lazy_static::lazy_static;
-use libc;
-use libc::{c_int, c_void};
+use libc::{self, c_int, c_void};
 use perf_event_open_sys as sys;
 use procfs;
-use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use crate::spe_decoder::{self, Events::*, PacketType::*, *};
+use crate::utils::*;
 
 const ARM_SPE_PMU_TYPE: u32 = 88;
 
-const ARM_SPE_JITTER: u64 = 1 << 16;
-const ARM_SPE_LOAD_FILTER: u64 = 1 << 33;
-const ARM_SPE_STORE_FILTER: u64 = 1 << 34;
+pub const ARM_SPE_TS: u64 = 1 << 0;
+pub const ARM_SPE_JITTER: u64 = 1 << 16;
+pub const ARM_SPE_LOAD_FILTER: u64 = 1 << 33;
+pub const ARM_SPE_STORE_FILTER: u64 = 1 << 34;
 
-const ARM_SPE_EVT_L1D_REFILL: u64 = 1 << 3;
-const ARM_SPE_EVT_TLB_REFILL: u64 = 1 << 5;
+pub const ARM_SPE_EVT_L1D_REFILL: u64 = 1 << 3;
+pub const ARM_SPE_EVT_TLB_REFILL: u64 = 1 << 5;
 
 const MMAP_PAGES: usize = 1 << 4;
 const AUX_PAGES: usize = 1 << 10;
 
 lazy_static! {
-    static ref PGSZ: usize = procfs::page_size() as _;
     static ref MMAP_SIZE: usize = *PGSZ * MMAP_PAGES;
     static ref AUX_SIZE: usize = *PGSZ * AUX_PAGES;
 }
@@ -41,12 +45,13 @@ struct perf_aux_record {
 }
 
 #[derive(Debug, Default)]
-struct Packet {
-    tlb: bool,
-    llc: bool,
-    va: u64,
-    lat: u64,
-    xlat: u64,
+pub struct Packet {
+    pub tlb: bool,
+    pub llc: bool,
+    pub va: u64,
+    pub lat: u64,
+    pub xlat: u64,
+    pub ts: u64,
 }
 
 #[derive(Debug)]
@@ -59,22 +64,25 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    pub fn new() -> Self {
+    pub fn new(pid: usize, cpu: usize, mode: Option<u64>) -> Self {
         let mut attrs = sys::bindings::perf_event_attr::default();
 
         attrs.type_ = ARM_SPE_PMU_TYPE;
         attrs.size = std::mem::size_of::<sys::bindings::perf_event_attr>() as u32;
 
-        attrs.config = ARM_SPE_JITTER | ARM_SPE_LOAD_FILTER | ARM_SPE_STORE_FILTER;
-        //attrs.__bindgen_anon_3.config1 = ARM_SPE_EVT_TLB_REFILL;
-        //attrs.__bindgen_anon_3.config1 = ARM_SPE_EVT_L1D_REFILL;
+        attrs.config = ARM_SPE_JITTER | ARM_SPE_LOAD_FILTER | ARM_SPE_STORE_FILTER | ARM_SPE_TS;
+        if let Some(mode) = mode {
+            attrs.__bindgen_anon_3.config1 = mode;
+            //attrs.__bindgen_anon_3.config1 = ARM_SPE_EVT_TLB_REFILL;
+            //attrs.__bindgen_anon_3.config1 = ARM_SPE_EVT_L1D_REFILL;
+        }
         attrs.__bindgen_anon_1.sample_period = 1024;
 
         attrs.sample_type = sys::bindings::PERF_SAMPLE_RAW;
 
         attrs.set_disabled(1);
 
-        let fd = unsafe { sys::perf_event_open(&mut attrs, 0, -1, -1, 0) };
+        let fd = unsafe { sys::perf_event_open(&mut attrs, pid as _, -1, -1, 0) };
         assert!(fd >= 0);
 
         let mmap_buf = unsafe {
@@ -125,18 +133,16 @@ impl Sampler {
         self.enabled = false;
     }
 
-    pub fn poll(&mut self, stop: Arc<AtomicBool>) {
+    pub fn poll(&mut self, stop: Arc<AtomicBool>, tx: Sender<Packet>) {
         unsafe {
             let data_buf = self
                 .mmap_buf
                 .wrapping_add((*self.metadata_page).data_offset as _);
 
             loop {
-                if stop.load(Ordering::Acquire) == true {
+                if stop.load(Ordering::Relaxed) == true {
                     break;
                 }
-
-                thread::sleep(Duration::from_millis(500));
 
                 let head = (*self.metadata_page).data_head;
                 let mut tail = (*self.metadata_page).data_tail;
@@ -164,12 +170,12 @@ impl Sampler {
                         let mut pkt = Packet::default();
 
                         while len > 0 {
-                            println!("Reading: {offset}, len: {len}");
+                            //println!("Reading: {offset}, len: {len}");
                             let (packet, sz) = spe_decoder::Packet::decode(
                                 self.aux_buf.wrapping_add(offset as _),
                                 len as _,
                             );
-                            println!("{packet:?} {sz}");
+                            //println!("{packet:?} {sz}");
 
                             match packet.pkt_type {
                                 ARM_SPE_EVENTS => {
@@ -193,14 +199,23 @@ impl Sampler {
                                     }
                                 }
                                 ARM_SPE_ADDRESS => {
-                                    if (packet.index == 0x2) {
+                                    if packet.index == 0x2 {
                                         //printf("VA: 0x%lx\n", packet.payload);
                                         pkt.va = packet.payload;
                                     }
                                 }
-                                ARM_SPE_END | ARM_SPE_TIMESTAMP => {
-                                    if (pkt.tlb || pkt.llc) {
-                                        println!("{pkt:?}");
+                                ARM_SPE_TIMESTAMP => {
+                                    pkt.ts = packet.payload;
+                                    if pkt.tlb || pkt.llc {
+                                        //println!("{pkt:?}");
+                                        tx.send(pkt).unwrap();
+                                        pkt = Packet::default();
+                                    }
+                                }
+                                ARM_SPE_END => {
+                                    if pkt.tlb || pkt.llc {
+                                        //println!("{pkt:?}");
+                                        tx.send(pkt).unwrap();
                                         pkt = Packet::default();
                                     }
                                 }
@@ -217,13 +232,14 @@ impl Sampler {
                     tail += header.size as u64;
                     (*self.metadata_page).data_tail = tail;
                 }
+                thread::sleep(Duration::from_millis(100));
             }
         }
     }
 
-    pub fn run(&mut self, stop: Arc<AtomicBool>) {
+    pub fn run(&mut self, stop: Arc<AtomicBool>, tx: Sender<Packet>) {
         self.enable();
-        self.poll(stop);
+        self.poll(stop, tx);
         self.disable();
     }
 }

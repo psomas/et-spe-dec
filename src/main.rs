@@ -1,39 +1,61 @@
-#![allow(unused)]
+//#![allow(unused)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::{
+    env,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::channel,
+        Arc,
+    },
+    thread,
+    time::Duration,
+};
 
+use ctrlc;
+
+mod pgsz;
 mod sampler;
 mod spe_decoder;
+mod utils;
 
 use sampler::*;
 
 fn main() {
+    let pid = env::args().nth(1).unwrap().parse::<usize>().unwrap();
+    let cpu = env::args().nth(2).unwrap().parse::<usize>().unwrap();
+
     let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = channel::<Packet>();
+
     let cloned = stop.clone();
     let sampler_thread = thread::spawn(move || {
-        let mut sampler = Sampler::new();
-        sampler.run(cloned);
+        let mut sampler = Sampler::new(pid, cpu, Some(ARM_SPE_EVT_TLB_REFILL));
+        sampler.run(cloned, tx);
     });
 
-    println!("Started the sampler, running the benchmark...");
+    let cloned = stop.clone();
+    ctrlc::set_handler(move || {
+        cloned.store(true, Ordering::Relaxed);
+    })
+    .unwrap();
 
-    loop {
-        let a = vec![1usize; 1 << 30];
-        let b = vec![2usize; 1 << 30];
-        let c = vec![3usize; 1 << 30];
+    println!("Started the sampler, press Ctrl+C to stop...");
 
-        let res = a.iter().chain(b.iter()).chain(c.iter()).sum::<usize>();
-        println!("{res:?}");
-        thread::sleep(Duration::from_millis(100));
+    let mut prev = 0;
+    let mut evts = 0;
+    while let Ok(pkt) = rx.recv() {
+        let sec = pkt.ts * 40 / 1000000000;
+        //println!("{pkt:?}, {sec}");
+
+        assert!(sec >= prev);
+        if sec > prev {
+            println!("{evts} evts / sec");
+            evts = 0;
+            prev = sec;
+        }
+        evts += 1;
     }
 
-    println!("Benchmark finished, stopping the sampler..");
-
-    stop.store(true, Ordering::Release);
     sampler_thread.join().unwrap();
-
     println!("Stopped sampler, exiting...");
 }
