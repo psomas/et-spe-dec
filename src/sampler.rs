@@ -1,7 +1,9 @@
 use std::{
-    ptr,
+    cmp,
+    collections::HashMap,
+    fmt, ptr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{self, AtomicBool},
         mpsc::Sender,
         Arc,
     },
@@ -14,10 +16,9 @@ use libc::{self, c_int, c_void};
 use perf_event_open_sys as sys;
 use procfs;
 
+use crate::pgsz;
 use crate::spe_decoder::{self, Events::*, PacketType::*, *};
 use crate::utils::*;
-
-const ARM_SPE_PMU_TYPE: u32 = 88;
 
 pub const ARM_SPE_TS: u64 = 1 << 0;
 pub const ARM_SPE_JITTER: u64 = 1 << 16;
@@ -27,13 +28,16 @@ pub const ARM_SPE_STORE_FILTER: u64 = 1 << 34;
 pub const ARM_SPE_EVT_L1D_REFILL: u64 = 1 << 3;
 pub const ARM_SPE_EVT_TLB_REFILL: u64 = 1 << 5;
 
-const MMAP_PAGES: usize = 1 << 4;
-const AUX_PAGES: usize = 1 << 10;
+/* FIXME: Make configurable */
+const MMAP_PAGES: usize = 1 << 2;
+const AUX_PAGES: usize = 1 << 13;
 
 lazy_static! {
     static ref MMAP_SIZE: usize = *PGSZ * MMAP_PAGES;
     static ref AUX_SIZE: usize = *PGSZ * AUX_PAGES;
 }
+
+//const ARM_SPE_PMU_TYPE: u32 = 99;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -44,7 +48,7 @@ struct perf_aux_record {
     aux_flags: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Packet {
     pub tlb: bool,
     pub llc: bool,
@@ -54,29 +58,50 @@ pub struct Packet {
     pub ts: u64,
 }
 
-#[derive(Debug)]
+impl Packet {
+    fn reset(&mut self) {
+        self.tlb = false;
+        self.llc = false;
+        self.va = 0;
+        self.lat = 0;
+        self.xlat = 0;
+        self.ts = 0;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Page {
+    pub vpn: u64,
+    pub tlb: u64,
+    pub llc: u64,
+    pub lat: u64,
+    pub xlat: u64,
+    pub ts: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct Sampler {
     fd: c_int,
     enabled: bool,
     mmap_buf: *mut c_void,
     aux_buf: *mut c_void,
     metadata_page: *mut sys::bindings::perf_event_mmap_page,
+    pages: HashMap<u64, Page>,
 }
 
 impl Sampler {
     pub fn new(pid: usize, cpu: usize, mode: Option<u64>) -> Self {
         let mut attrs = sys::bindings::perf_event_attr::default();
 
-        attrs.type_ = ARM_SPE_PMU_TYPE;
+        attrs.type_ = *ARM_SPE_PMU_TYPE;
         attrs.size = std::mem::size_of::<sys::bindings::perf_event_attr>() as u32;
 
         attrs.config = ARM_SPE_JITTER | ARM_SPE_LOAD_FILTER | ARM_SPE_STORE_FILTER | ARM_SPE_TS;
         if let Some(mode) = mode {
             attrs.__bindgen_anon_3.config1 = mode;
-            //attrs.__bindgen_anon_3.config1 = ARM_SPE_EVT_TLB_REFILL;
-            //attrs.__bindgen_anon_3.config1 = ARM_SPE_EVT_L1D_REFILL;
         }
-        attrs.__bindgen_anon_1.sample_period = 1024;
+        /* FIXME: make configurable */
+        attrs.__bindgen_anon_1.sample_period = 4096;
 
         attrs.sample_type = sys::bindings::PERF_SAMPLE_RAW;
 
@@ -120,7 +145,47 @@ impl Sampler {
             mmap_buf,
             aux_buf,
             metadata_page,
+            pages: HashMap::new(),
         }
+    }
+
+    fn shutdown(&mut self) {
+        unsafe {
+            assert!(libc::close(self.fd) >= 0);
+            assert!(libc::munmap(self.mmap_buf, *PGSZ + *MMAP_SIZE) >= 0);
+            assert!(libc::munmap(self.aux_buf, *AUX_SIZE) >= 0);
+        };
+        /* quiesce */
+        thread::sleep(Duration::from_millis(500));
+    }
+
+    fn process_packet(&mut self, pkt: &mut Packet) {
+        let vpn = pgsz::Size::Pte.align(pkt.va as _) as _;
+        let ts = tsc_to_secs(pkt.ts);
+
+        self.pages
+            .entry(vpn)
+            .and_modify(|page| {
+                if pkt.tlb {
+                    page.tlb += 1;
+                }
+
+                if pkt.llc {
+                    page.llc += 1;
+                }
+
+                page.lat += pkt.lat;
+                page.xlat += pkt.xlat;
+                page.ts = ts;
+            })
+            .or_insert(Page {
+                vpn,
+                tlb: if pkt.tlb { 1 } else { 0 },
+                llc: if pkt.llc { 1 } else { 0 },
+                lat: pkt.lat,
+                xlat: pkt.xlat,
+                ts,
+            });
     }
 
     pub fn enable(&mut self) {
@@ -133,24 +198,21 @@ impl Sampler {
         self.enabled = false;
     }
 
-    pub fn poll(&mut self, stop: Arc<AtomicBool>, tx: Sender<Packet>) {
+    pub fn poll(&mut self, stop: Arc<AtomicBool>, tx: Sender<Vec<Page>>) {
+        let mut prev = 0;
+        let mut current = 0;
+
         unsafe {
             let data_buf = self
                 .mmap_buf
                 .wrapping_add((*self.metadata_page).data_offset as _);
 
             loop {
-                if stop.load(Ordering::Relaxed) == true {
-                    break;
-                }
-
                 let head = (*self.metadata_page).data_head;
                 let mut tail = (*self.metadata_page).data_tail;
 
-                //println!("{head:?} {tail:?}");
-
                 while tail < head {
-                    let record = data_buf.wrapping_add(tail as usize);
+                    let record = data_buf.wrapping_add(tail as usize % *MMAP_SIZE);
                     let header = &mut *(record as *mut sys::bindings::perf_event_header);
 
                     //println!("{head:?} {tail:?} {header:?}");
@@ -171,36 +233,43 @@ impl Sampler {
 
                         while len > 0 {
                             //println!("Reading: {offset}, len: {len}");
-                            let (packet, sz) = spe_decoder::Packet::decode(
-                                self.aux_buf.wrapping_add(offset as _),
+                            let (packet, mut sz) = spe_decoder::Packet::decode(
+                                self.aux_buf.wrapping_add(offset as usize % *AUX_SIZE),
                                 len as _,
                             );
                             //println!("{packet:?} {sz}");
 
                             match packet.pkt_type {
+                                ARM_SPE_BAD => {
+                                    //panic!("Bad packet!");
+                                    pkt.reset();
+                                    println!("Bad packet!");
+                                    break;
+                                }
                                 ARM_SPE_EVENTS => {
                                     if packet.payload & (1u64 << EV_TLB_WALK as u64) != 0 {
-                                        //printf("TLB walk\n");
+                                        //println!("TLB walk\n");
                                         pkt.tlb = true;
                                     }
-                                    if packet.payload & (1u64 << EV_LLC_MISS as u64) != 0 {
-                                        //printf("LLC miss\n");
+                                    if packet.payload & (1u64 << EV_LLC_MISS as u64) != 0
+                                        || packet.payload & (1u64 << EV_LLC_ACCESS as u64) != 0
+                                    {
+                                        //println!("LLC miss\n");
                                         pkt.llc = true;
                                     }
                                 }
                                 ARM_SPE_COUNTER => {
-                                    if packet.index == spe_decoder::SPE_CNT_PKT_HDR_INDEX_TOTAL_LAT
-                                    {
-                                        //printf("TOT: %lu\n", packet.payload);
+                                    if packet.index == SPE_CNT_PKT_HDR_INDEX_TOTAL_LAT {
+                                        //println!("TOT: {}\n", packet.payload);
                                         pkt.lat = packet.payload;
                                     } else if packet.index == SPE_CNT_PKT_HDR_INDEX_TRANS_LAT {
-                                        //printf("TOT: %lu\n", packet.payload);
+                                        //println!("TOT: {}\n", packet.payload);
                                         pkt.xlat = packet.payload;
                                     }
                                 }
                                 ARM_SPE_ADDRESS => {
                                     if packet.index == 0x2 {
-                                        //printf("VA: 0x%lx\n", packet.payload);
+                                        //println!("VA: {:x}\n", packet.payload);
                                         pkt.va = packet.payload;
                                     }
                                 }
@@ -208,15 +277,42 @@ impl Sampler {
                                     pkt.ts = packet.payload;
                                     if pkt.tlb || pkt.llc {
                                         //println!("{pkt:?}");
-                                        tx.send(pkt).unwrap();
-                                        pkt = Packet::default();
+                                        //tx.send(pkt).unwrap();
+                                        //pkt = Packet::default();
+
+                                        let current = tsc_to_secs(pkt.ts);
+                                        //println!("{prev} {current}");
+
+                                        //assert!(current >= prev);
+                                        if current < prev && current != 0 {
+                                            println!("out-of-order packet!");
+                                        }
+
+                                        if prev > 0 && current > prev {
+                                            tx.send(
+                                                self.pages.values().cloned().collect::<Vec<Page>>(),
+                                            )
+                                            .unwrap();
+                                            self.pages = HashMap::new();
+                                        }
+                                        prev = current;
+
+                                        self.process_packet(&mut pkt);
+                                        pkt.reset();
+                                    }
+
+                                    if stop.load(atomic::Ordering::Relaxed) == true {
+                                        return;
                                     }
                                 }
                                 ARM_SPE_END => {
                                     if pkt.tlb || pkt.llc {
-                                        //println!("{pkt:?}");
-                                        tx.send(pkt).unwrap();
-                                        pkt = Packet::default();
+                                        self.process_packet(&mut pkt);
+                                        pkt.reset();
+                                    }
+
+                                    if stop.load(atomic::Ordering::Relaxed) == true {
+                                        return;
                                     }
                                 }
                                 _ => (),
@@ -232,14 +328,19 @@ impl Sampler {
                     tail += header.size as u64;
                     (*self.metadata_page).data_tail = tail;
                 }
-                thread::sleep(Duration::from_millis(100));
+
+                thread::sleep(Duration::from_millis(50));
+                if stop.load(atomic::Ordering::Relaxed) == true {
+                    return;
+                }
             }
         }
     }
 
-    pub fn run(&mut self, stop: Arc<AtomicBool>, tx: Sender<Packet>) {
+    pub fn run(&mut self, stop: Arc<AtomicBool>, tx: Sender<Vec<Page>>) {
         self.enable();
         self.poll(stop, tx);
         self.disable();
+        self.shutdown();
     }
 }

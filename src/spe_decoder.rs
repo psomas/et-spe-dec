@@ -276,6 +276,7 @@ impl Packet {
             return (packet, len);
         }
 
-        panic!("bad packet");
+        return (packet, 1);
+        //panic!("bad packet!");
     }
 }
