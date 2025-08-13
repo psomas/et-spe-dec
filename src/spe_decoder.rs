@@ -235,12 +235,12 @@ impl Packet {
 
             if packet.hdr == SPE_HEADER1_ALIGNMENT {
                 panic!("fixme");
-                let alignment = 1 << ((packet.hdr & 0xf) + 1);
-
-                assert!(len >= alignment);
-
-                packet.pkt_type = ARM_SPE_PAD;
-                return (packet, alignment - (buf as usize & (alignment - 1))); // FIXME
+                /*
+                                let alignment = 1 << ((packet.hdr & 0xf) + 1);
+                                assert!(len >= alignment);
+                                packet.pkt_type = ARM_SPE_PAD;
+                                return (packet, alignment - (buf as usize & (alignment - 1))); // FIXME
+                */
             }
         }
 

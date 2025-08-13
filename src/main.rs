@@ -8,34 +8,36 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ctrlc;
 
 mod ema;
 mod pgsz;
+mod prctl;
+mod profiler;
 mod sampler;
 mod spe_decoder;
 mod utils;
 
 use ema::*;
+use profiler::*;
 use sampler::*;
 use utils::*;
 
 const TLBMISS_LOW_WMARK: usize = 500;
 const TLBMISS_HIGH_WMARK: usize = 100;
-const EMA_PERIOD: usize = 10;
+const EMA_PERIOD: usize = 5;
 
-const fn mode2str(mode: u64) -> &'static str {
-    if mode == ARM_SPE_EVT_TLB_REFILL {
-        "TLB misses"
-    } else {
-        "LLC accesses"
-    }
-}
-
-fn run(pid: usize, cpu: usize, mode: u64, stop: Arc<AtomicBool>) {
+fn run(
+    profiler: &mut Profiler,
+    pid: usize,
+    comm: String,
+    cpu: usize,
+    mode: u64,
+    stop: Arc<AtomicBool>,
+) {
     let tlb = mode == ARM_SPE_EVT_TLB_REFILL;
     let (tx, rx) = channel::<Vec<Page>>();
 
@@ -49,15 +51,22 @@ fn run(pid: usize, cpu: usize, mode: u64, stop: Arc<AtomicBool>) {
     let mut llc_ema = ExponentialMovingAverage::new(EMA_PERIOD as _);
 
     println!(
-        "Started the sampler ({}) , press Ctrl+C to stop...",
+        "Started the sampler ({}), press Ctrl+C to stop...",
         mode2str(mode)
     );
 
     let mut iterations = 0;
+    let mut epoch = 0;
 
     loop {
-        if let Ok(pages) = rx.recv_timeout(Duration::from_secs(EMA_PERIOD as _)) {
+        let start = Instant::now();
+        if let Ok(pages) = rx.recv_timeout(Duration::from_secs(
+            sampler::POLL_SLEEP_MS as u64 * sampler::TX_THRESHOLD as u64 * 2 / 1000,
+        )) {
             assert!(pages.len() > 0);
+
+            let elapsed = start.elapsed().as_millis();
+            println!("Polled for {elapsed}ms...");
 
             let misses: u64 = pages.iter().map(|page| page.tlb).sum();
             let llc: u64 = pages.iter().map(|page| page.llc).sum();
@@ -72,6 +81,8 @@ fn run(pid: usize, cpu: usize, mode: u64, stop: Arc<AtomicBool>) {
                 tlb_ema.current_ema(),
                 llc_ema.current_ema()
             );
+
+            profiler.ingest(epoch, mode, pages);
         } else {
             println!("recv timeout!");
             for _ in 0..EMA_PERIOD {
@@ -80,6 +91,8 @@ fn run(pid: usize, cpu: usize, mode: u64, stop: Arc<AtomicBool>) {
             }
             iterations = EMA_PERIOD;
         }
+
+        epoch += 1;
 
         if iterations >= EMA_PERIOD && tlb && tlb_ema.current_ema() < TLBMISS_LOW_WMARK as _ {
             println!(
@@ -110,7 +123,14 @@ fn run(pid: usize, cpu: usize, mode: u64, stop: Arc<AtomicBool>) {
 
 fn main() {
     let pid = env::args().nth(1).unwrap().parse::<usize>().unwrap();
+    let comm = procfs::process::Process::new(pid as _)
+        .unwrap()
+        .stat()
+        .unwrap()
+        .comm;
     let cpu = env::args().nth(2).unwrap().parse::<usize>().unwrap();
+
+    println!("Enabling Leshy for {pid} ({comm})");
 
     let stop = Arc::new(AtomicBool::new(false));
     let cloned = stop.clone();
@@ -119,11 +139,14 @@ fn main() {
     })
     .unwrap();
 
+    let mut profiler = Profiler::new(pid as _, comm.clone());
+    println!("Started the profiler...");
+
     let mut mode = ARM_SPE_EVT_TLB_REFILL;
 
     loop {
         println!("Sampling {}...", mode2str(mode));
-        run(pid, cpu, mode, stop.clone());
+        run(&mut profiler, pid, comm.clone(), cpu, mode, stop.clone());
 
         if mode == ARM_SPE_EVT_TLB_REFILL {
             mode = ARM_SPE_EVT_L1D_REFILL;

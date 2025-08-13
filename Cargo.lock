@@ -106,16 +106,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "epoll"
-version = "4.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74351c3392ea1ff6cd2628e0042d268ac2371cb613252ff383b6dfa50d22fa79"
-dependencies = [
- "bitflags",
- "libc",
-]
-
-[[package]]
 name = "errno"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -324,7 +314,6 @@ version = "0.1.0"
 dependencies = [
  "constcat",
  "ctrlc",
- "epoll",
  "lazy_static",
  "libc",
  "perf-event-open-sys",

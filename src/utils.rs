@@ -4,6 +4,7 @@ use constcat::concat;
 use lazy_static::lazy_static;
 use procfs;
 
+/* sysfs paths */
 pub const SYSFS_THP: &'static str = "/sys/kernel/mm/transparent_hugepage";
 pub const SYSFS_HPMD_SIZE: &'static str = concat!(SYSFS_THP, "/hpage_pmd_size");
 pub const SYSFS_KHUGE_SCANPAGES: &'static str = concat!(SYSFS_THP, "/khugepaged/pages_to_scan");
@@ -29,16 +30,16 @@ lazy_static! {
         .trim()
         .parse()
         .unwrap();
-    pub static ref CNTFRQ_EL0: u64 = {
-        let val: u64;
-        unsafe { asm!("mrs {}, cntfrq_el0", out(reg) val) };
-        val
-    };
     pub static ref ARM_SPE_PMU_TYPE: u32 = fs::read_to_string(SYSFS_SPE_PMU_TYPE)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
+    pub static ref CNTFRQ_EL0: u64 = {
+        let val: u64;
+        unsafe { asm!("mrs {}, cntfrq_el0", out(reg) val) };
+        val
+    };
 }
 
 const SUFFIXES: [&str; 8] = ["", "K", "M", "G", "T", "P", "E", "Z"];
@@ -60,7 +61,6 @@ fn _align(n: usize, m: usize, up: bool) -> usize {
     if up && (ret != n) {
         ret += m;
     }
-
     ret
 }
 
@@ -72,10 +72,6 @@ pub fn align_down(n: usize, m: usize) -> usize {
     _align(n, m, false)
 }
 
-pub fn tsc_to_ns(n: u64) -> u64 {
-    n * 1_000_000_000 / *CNTFRQ_EL0
-}
-
 pub fn tsc_to_secs(n: u64) -> u64 {
-    tsc_to_ns(n) / 1_000_000_000
+    n / *CNTFRQ_EL0
 }

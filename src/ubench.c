@@ -11,7 +11,7 @@
 #endif
 
 #ifndef	THP_SIZE
-#define THP_SIZE	(2UL << 20)      // 2 KiB
+#define THP_SIZE	(2UL << 20)      // 2 MiB
 #endif
 
 int main(int argc, char *argv[]) {
@@ -89,18 +89,20 @@ int main(int argc, char *argv[]) {
 
     printf("Re-allocated buffer of size %zu bytes at address %p\n", buffer_size, buffer);
 
-	memset(buffer, 0xfe, buffer_size);
-
-	printf("Issuing MADV_COLLAPSE...\n");
+	printf("Issuing MADV_HUGEPAGE...\n");
 	assert(!madvise(buffer, buffer_size, MADV_HUGEPAGE));
-	assert(!madvise(buffer, buffer_size, MADV_COLLAPSE));
-	assert(!madvise(buffer, buffer_size, MADV_POPULATE_WRITE));
 
 	memset(buffer, 0xfe, buffer_size);
+
+	//printf("Issuing MADV_COLLAPSE...\n");
+	//assert(!madvise(buffer, buffer_size, MADV_HUGEPAGE));
+	//assert(!madvise(buffer, buffer_size, MADV_COLLAPSE));
+	//assert(!madvise(buffer, buffer_size, MADV_POPULATE_WRITE));
+	//memset(buffer, 0xfe, buffer_size);
 
     printf("Repeatedly accessing initialized pages, %ld loops...\n", num_access_loops);
 
-    for (long loop = 0; loop < num_access_loops; ++loop) {
+    for (long loop = 0; loop < num_access_loops * 2; ++loop) {
         for (i = 0; i < num_tlb_entries; ++i) {
             // Calculate the address of the first byte of the first 4KiB page in the i-th region
             uint8_t *access_address = (uint8_t *)buffer + (size_t)i * THP_SIZE;
