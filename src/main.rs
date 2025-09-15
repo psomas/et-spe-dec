@@ -37,7 +37,8 @@ fn run(
     cpu: usize,
     mode: u64,
     stop: Arc<AtomicBool>,
-) {
+    start_epoch: usize,
+) -> usize {
     let tlb = mode == ARM_SPE_EVT_TLB_REFILL;
     let (tx, rx) = channel::<Vec<Page>>();
 
@@ -56,7 +57,7 @@ fn run(
     );
 
     let mut iterations = 0;
-    let mut epoch = 0;
+    let mut epoch = start_epoch;
 
     loop {
         let start = Instant::now();
@@ -90,6 +91,7 @@ fn run(
                 llc_ema.update(0 as _);
             }
             iterations = EMA_PERIOD;
+            profiler.ingest(epoch, mode, vec![]);
         }
 
         epoch += 1;
@@ -119,6 +121,8 @@ fn run(
     sampler_thread.join().unwrap();
     println!("Stopped the sampler, exiting...");
     stop.store(false, Ordering::Relaxed);
+
+    return epoch;
 }
 
 fn main() {
@@ -144,9 +148,18 @@ fn main() {
 
     let mut mode = ARM_SPE_EVT_TLB_REFILL;
 
+    let mut epoch = 0;
     loop {
         println!("Sampling {}...", mode2str(mode));
-        run(&mut profiler, pid, comm.clone(), cpu, mode, stop.clone());
+        epoch = run(
+            &mut profiler,
+            pid,
+            comm.clone(),
+            cpu,
+            mode,
+            stop.clone(),
+            epoch,
+        );
 
         if mode == ARM_SPE_EVT_TLB_REFILL {
             mode = ARM_SPE_EVT_L1D_REFILL;

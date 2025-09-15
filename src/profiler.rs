@@ -4,6 +4,7 @@
 use crate::pgsz::*;
 use crate::utils::*;
 use lazy_static::lazy_static;
+use pagemap::*;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -109,7 +110,10 @@ pub struct Profiler {
     samples: [Vec<Entry>; EPOCHS],
     hints: [Vec<Entry>; EPOCHS],
     hinted: HashSet<(usize, Size)>,
+    pagemap: [HashSet<usize>; Size::COUNT],
     skip: Vec<Entry>,
+    mode: u64,
+    mode_epoch: usize,
 }
 
 impl Profiler {
@@ -122,7 +126,10 @@ impl Profiler {
             samples: std::array::from_fn(|_| vec![]),
             hints: std::array::from_fn(|_| vec![]),
             hinted: HashSet::new(),
+            pagemap: std::array::from_fn(|_| HashSet::new()),
             skip: vec![],
+            mode: 0,
+            mode_epoch: 0,
         }
     }
 
@@ -585,6 +592,53 @@ impl Profiler {
         println!("Hints finalized in in {}ms\n", elapsed.as_millis());
     }
 
+    fn scan_pagemap(&mut self) {
+        let mut pagemap = PageMap::new(self.pid as _).unwrap();
+        let mut vmas: Vec<VirtualMemoryArea> = pagemap
+            .maps()
+            .unwrap()
+            .into_iter()
+            .map(|x| x.vma())
+            .collect();
+
+        /* sort vmas by size */
+        vmas.sort_by(|x, y| y.size().cmp(&x.size()));
+
+        for vma in vmas.iter() {
+            //println!("scanning vma {vma:?} ({})", size_to_str(vma.size() as _));
+
+            let start = vma.start_address();
+            let end = vma.last_address();
+
+            let mut addr = start;
+            while addr <= end {
+                let vpn = addr >> 12;
+                let entry = pagemap.pagemap_vpn(vpn).unwrap();
+
+                if !entry.present()
+                    || !entry.anon().unwrap_or(false)
+                    || !entry.thp().unwrap_or(false)
+                {
+                    addr += Size::Pte.bytes() as u64;
+                    continue;
+                }
+
+                let raw = entry.raw_pagemap();
+                if raw >> 60 & 1 != 0 {
+                    assert!(addr as usize == Size::ContPmd.align(addr as usize));
+                    self.pagemap[Size::ContPmd as usize].insert(addr as usize);
+                    addr += Size::ContPmd.bytes() as u64;
+                } else if raw >> 59 & 1 != 0 {
+                    assert!(addr as usize == Size::Pmd.align(addr as usize));
+                    self.pagemap[Size::Pmd as usize].insert(addr as usize);
+                    addr += Size::Pmd.bytes() as u64;
+                } else {
+                    addr += Size::Pte.bytes() as u64;
+                }
+            }
+        }
+    }
+
     fn generate_access_hints(&mut self, buckets: [Vec<Entry>; Size::COUNT]) {
         let mut hints: HashMap<(usize, Size), usize> =
             self.hinted.clone().into_iter().map(|x| (x, 0)).collect();
@@ -599,14 +653,89 @@ impl Profiler {
         }
 
         let mut res = hints.into_iter().collect::<Vec<((usize, Size), usize)>>();
+
+        if res.len() == 0 {
+            println!("no demotions, diff: {}!", self.epoch - self.mode_epoch);
+            if self.epoch - self.mode_epoch > EPOCHS {
+                println!("demoting from pagemap!");
+                let set: HashSet<usize> =
+                    HashSet::from_iter(buckets[Size::ContPmd as usize].iter().filter_map(|x| {
+                        if x.epochs != 0 {
+                            Some(x.base)
+                        } else {
+                            None
+                        }
+                    }));
+                let mut total = 0;
+                let candidates = self.pagemap[Size::ContPmd as usize].clone();
+                println!("candidates: {}, set: {}", candidates.len(), set.len());
+                for candidate in candidates.iter() {
+                    if !set.contains(candidate) {
+                        assert!(*candidate == Size::ContPmd.align(*candidate));
+                        //println!("contpmd demotion candidate {candidate}");
+                        total += 1;
+                        /* FIXME: hardcoded demote limit */
+                        if total > 32 {
+                            break;
+                        }
+                        madvise_demote(self.pid, *candidate);
+                        self.pagemap[Size::ContPmd as usize].remove(candidate);
+                    }
+                }
+                println!(
+                    "total contpmd candidates {total} ({})",
+                    size_to_str(total * Size::ContPmd.bytes())
+                );
+
+                let set: HashSet<usize> =
+                    HashSet::from_iter(buckets[Size::ContPmd as usize].iter().filter_map(|x| {
+                        if x.epochs != 0 {
+                            Some(x.base)
+                        } else {
+                            None
+                        }
+                    }));
+                let mut total = 0;
+                let candidates = self.pagemap[Size::Pmd as usize].clone();
+                for candidate in candidates.iter() {
+                    if !set.contains(candidate) {
+                        assert!(*candidate == Size::Pmd.align(*candidate));
+                        //println!("contpmd demotion candidate {candidate}");
+                        total += 1;
+                        if total > 32 * 16 {
+                            break;
+                        }
+                        madvise_demote(self.pid, *candidate);
+                        self.pagemap[Size::Pmd as usize].remove(candidate);
+                    }
+                }
+
+                println!(
+                    "total pmd candidates {total} ({})",
+                    size_to_str(total * Size::Pmd.bytes())
+                );
+                println!(
+                    "contpmds: {}, pmds: {}",
+                    self.pagemap[Size::ContPmd as usize].len(),
+                    self.pagemap[Size::Pmd as usize].len()
+                );
+            }
+
+            return;
+        }
+
         res.sort_by(|x, y| x.1.cmp(&y.1));
 
+        disable_coala_khuge();
+        clear_hints(self.pid);
         res.iter()
             .filter(|(_, sampled)| *sampled == 0)
             .for_each(|((address, sz), sampled)| {
                 println!("Demoting 0x{address:x}, sz: {sz:?}, sampled: {sampled}");
                 madvise_demote(self.pid, *address);
+                self.hinted.remove(&(*address, *sz));
             });
+        enable_coala_khuge();
     }
 
     pub fn ingest(&mut self, epoch: usize, mode: u64, pages: Vec<Page>) {
@@ -627,6 +756,7 @@ impl Profiler {
             entries
                 .entry(page.vpn as _)
                 .and_modify(|entry| {
+                    panic!("shouldn't reach this!");
                     entry.misses += page.tlb as usize;
                     entry.accesses += page.llc as usize;
                     entry.cumlat += page.xlat as usize;
@@ -669,9 +799,30 @@ impl Profiler {
         });
         println!();
 
+        println!("{} {}", mode, self.mode);
         match mode {
-            ARM_SPE_EVT_TLB_REFILL => self.generate_miss_hints(buckets),
-            ARM_SPE_EVT_L1D_REFILL => self.generate_access_hints(buckets),
+            ARM_SPE_EVT_TLB_REFILL => {
+                if mode != self.mode {
+                    println!("setting mode to tlb!");
+                    self.mode_epoch = self.epoch;
+                    self.mode = mode;
+                }
+                self.generate_miss_hints(buckets);
+            }
+            ARM_SPE_EVT_L1D_REFILL => {
+                if mode != self.mode {
+                    println!("setting mode to access!");
+                    self.mode = mode;
+                    self.mode_epoch = self.epoch;
+
+                    let now = Instant::now();
+                    self.scan_pagemap();
+                    let elapsed = now.elapsed();
+                    println!("pagemap scanned in {}ms\n", elapsed.as_millis());
+                }
+                self.generate_access_hints(buckets);
+            }
+
             _ => panic!("Unknown mode!"),
         };
     }

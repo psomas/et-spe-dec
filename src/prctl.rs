@@ -44,8 +44,21 @@ fn process_madvise(pidfd: i64, ranges: &[(usize, usize)], advice: usize, flags: 
     }
 }
 
-pub fn load_hints(pid: u32, hints: &Vec<Range<usize>>) {
+pub fn clear_hints(pid: u32) {
     fs::write(format!("/proc/{}/coala_hints", pid), "1").unwrap();
+}
+
+pub fn disable_coala_khuge() {
+    fs::write(SYSFS_COALA_KHUGE, "0").unwrap();
+}
+
+pub fn enable_coala_khuge() {
+    fs::write(SYSFS_COALA_KHUGE, "1").unwrap();
+}
+
+pub fn load_hints(pid: u32, hints: &Vec<Range<usize>>) {
+    disable_coala_khuge();
+    clear_hints(pid);
     let pidfd = pidfd_open(pid, 0);
 
     /* FIXME: */
@@ -85,7 +98,7 @@ pub fn load_hints(pid: u32, hints: &Vec<Range<usize>>) {
                 }
             });
     }
-    fs::write(SYSFS_COALA_KHUGE, "1").unwrap();
+    enable_coala_khuge();
 }
 
 pub fn enable_et(pid: u32) {
@@ -100,5 +113,8 @@ pub fn enable_et(pid: u32) {
 
 pub fn madvise_demote(pid: u32, address: usize) {
     let pidfd = pidfd_open(pid, 0);
-    assert!(process_madvise(pidfd, &[(address, 4096)], MADV_DEMOTE, 0) >= 0);
+    //assert!(process_madvise(pidfd, &[(address, 4096)], MADV_DEMOTE, 0) >= 0);
+    if process_madvise(pidfd, &[(address, 4096)], MADV_DEMOTE, 0) < 0 {
+        println!("madvise demote failed for 0x{address:x}");
+    }
 }
