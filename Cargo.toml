@@ -12,3 +12,8 @@ perf-event-open-sys = "5.0.0"
 procfs = "0.17.0"
 strum = { version = "0.27.1", features = ["derive", "strum_macros"] }
 pagemap = { path = "../etutils-rs/pagemap-rs" }
+image = "0.25.8"
+
+[[bin]]
+name="access_heatmap"
+path = "src/access_heatmap.rs"

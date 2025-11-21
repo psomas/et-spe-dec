@@ -26,8 +26,8 @@ use profiler::*;
 use sampler::*;
 use utils::*;
 
-const TLBMISS_LOW_WMARK: usize = 500;
-const TLBMISS_HIGH_WMARK: usize = 100;
+const TLBMISS_LOW_WMARK: usize = 1000;
+const TLBMISS_HIGH_WMARK: usize = 500;
 const EMA_PERIOD: usize = 5;
 
 fn run(

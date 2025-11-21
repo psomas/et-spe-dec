@@ -35,9 +35,9 @@ pub const fn mode2str(mode: u64) -> &'static str {
 }
 
 /* FIXME: Make configurable */
-const MMAP_PAGES: usize = 1 << 4;
-const AUX_PAGES: usize = 1 << 10;
-const ARM_SPE_SAMPLE_PERIOD: u64 = 4096;
+const MMAP_PAGES: usize = 1 << 5;
+const AUX_PAGES: usize = 1 << 15;
+const ARM_SPE_SAMPLE_PERIOD: u64 = 1024;
 
 pub const POLL_SLEEP_MS: usize = 500;
 pub const TX_THRESHOLD: usize = 9;
@@ -80,6 +80,7 @@ impl Packet {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Page {
     pub vpn: u64,
+    pub samples: u64,
     pub tlb: u64,
     pub llc: u64,
     pub lat: u64,
@@ -174,6 +175,8 @@ impl Sampler {
         self.pages
             .entry(vpn)
             .and_modify(|page| {
+                page.samples += 1;
+
                 if pkt.tlb {
                     page.tlb += 1;
                 }
@@ -188,6 +191,7 @@ impl Sampler {
             })
             .or_insert(Page {
                 vpn,
+                samples: 1,
                 tlb: if pkt.tlb { 1 } else { 0 },
                 llc: if pkt.llc { 1 } else { 0 },
                 lat: pkt.lat,
@@ -223,8 +227,6 @@ impl Sampler {
             while tail < head {
                 let record = data_buf.wrapping_add(tail as usize % *MMAP_SIZE);
                 let header = unsafe { &mut *(record as *mut sys::bindings::perf_event_header) };
-
-                //println!("{head:?} {tail:?} {header:?}");
 
                 if header.type_ == sys::bindings::PERF_RECORD_AUX {
                     let aux_record = unsafe { &mut *(record as *mut perf_aux_record) };
@@ -325,10 +327,10 @@ impl Sampler {
                                 }
                             }
                             ARM_SPE_END => {
-                                if pkt.tlb || pkt.llc {
-                                    self.process_packet(&mut pkt);
-                                    pkt.reset();
-                                }
+                                //if pkt.tlb || pkt.llc {
+                                self.process_packet(&mut pkt);
+                                pkt.reset();
+                                //}
 
                                 if stop.load(atomic::Ordering::Relaxed) == true {
                                     return;

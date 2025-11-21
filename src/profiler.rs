@@ -179,10 +179,8 @@ impl Profiler {
 
         load_hints(self.pid, &_hints);
 
-        /*
-                fs::write(format!("/proc/{}/coala_hints", self.pid), "1").unwrap();
-                fs::write(SYSFS_COALA_KHUGE, "1").unwrap();
-        */
+        fs::write(format!("/proc/{}/coala_hints", self.pid), "1").unwrap();
+        fs::write(SYSFS_COALA_KHUGE, "1").unwrap();
     }
 
     fn solve(&self, state: State, buckets: [Vec<Entry>; Size::COUNT]) -> Option<Vec<Entry>> {
@@ -465,7 +463,7 @@ impl Profiler {
             }
         }
 
-        self.write_hints(&res[..nr]);
+        //self.write_hints(&res[..nr]);
 
         self.hints[self.epoch % EPOCHS] = res[..nr].to_vec();
         self.update_hinted(res[..nr].to_vec());
@@ -655,8 +653,13 @@ impl Profiler {
         let mut res = hints.into_iter().collect::<Vec<((usize, Size), usize)>>();
 
         if res.len() == 0 {
-            println!("no demotions, diff: {}!", self.epoch - self.mode_epoch);
-            if self.epoch - self.mode_epoch > EPOCHS {
+            println!(
+                "no demotions, diff: {} {} {}!",
+                self.epoch - self.mode_epoch,
+                self.epoch,
+                self.mode_epoch
+            );
+            if (self.epoch - self.mode_epoch) % EPOCHS == EPOCHS - 1 {
                 println!("demoting from pagemap!");
                 let set: HashSet<usize> =
                     HashSet::from_iter(buckets[Size::ContPmd as usize].iter().filter_map(|x| {
@@ -675,7 +678,7 @@ impl Profiler {
                         //println!("contpmd demotion candidate {candidate}");
                         total += 1;
                         /* FIXME: hardcoded demote limit */
-                        if total > 32 {
+                        if total > 16 * EPOCHS {
                             break;
                         }
                         madvise_demote(self.pid, *candidate);
@@ -702,7 +705,7 @@ impl Profiler {
                         assert!(*candidate == Size::Pmd.align(*candidate));
                         //println!("contpmd demotion candidate {candidate}");
                         total += 1;
-                        if total > 32 * 16 {
+                        if total > 16 * 16 * EPOCHS {
                             break;
                         }
                         madvise_demote(self.pid, *candidate);
@@ -799,7 +802,6 @@ impl Profiler {
         });
         println!();
 
-        println!("{} {}", mode, self.mode);
         match mode {
             ARM_SPE_EVT_TLB_REFILL => {
                 if mode != self.mode {
