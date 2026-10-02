@@ -17,6 +17,7 @@ pub enum PacketType {
     ARM_SPE_EVENTS,
     ARM_SPE_DATA_SOURCE,
 }
+
 use PacketType::*;
 
 #[derive(Debug)]
@@ -150,9 +151,21 @@ impl Packet {
 
         self.payload = match self.payload_len() {
             1 => unsafe { *(self.buf.wrapping_add(self.hdr_len as _) as *mut u8) as _ },
-            2 => unsafe { *(self.buf.wrapping_add(self.hdr_len as _) as *mut u16) as _ },
-            4 => unsafe { *(self.buf.wrapping_add(self.hdr_len as _) as *mut u32) as _ },
-            8 => unsafe { *(self.buf.wrapping_add(self.hdr_len as _) as *mut u64) as _ },
+            2 => unsafe {
+                u16::from_le(std::ptr::read_unaligned(
+                    self.buf.wrapping_add(self.hdr_len as _).cast(),
+                )) as _
+            },
+            4 => unsafe {
+                u32::from_le(std::ptr::read_unaligned(
+                    self.buf.wrapping_add(self.hdr_len as _).cast(),
+                )) as _
+            },
+            8 => unsafe {
+                u64::from_le(std::ptr::read_unaligned(
+                    self.buf.wrapping_add(self.hdr_len as _).cast(),
+                ))
+            },
             _ => panic!("bad header"),
         };
     }
@@ -162,6 +175,11 @@ impl Packet {
     }
 
     pub fn decode(buf: *mut c_void, len: usize) -> (Self, usize) {
+        Self::decode_at(buf, len, buf as usize)
+    }
+
+    /// Decode one packet at its original stream offset; size zero means more bytes are needed.
+    pub fn decode_at(buf: *mut c_void, len: usize, offset: usize) -> (Self, usize) {
         assert!(len > 0);
 
         let mut packet = Packet {
@@ -187,6 +205,27 @@ impl Packet {
             return (packet, 1);
         }
 
+        // Check the entire packet before reading any payload. AUX chunks may end mid-packet.
+        let extended = packet.hdr as u64 & SPE_HEADER0_MASK2 == SPE_HEADER0_EXTENDED as u64;
+        let header_len = if extended { 2 } else { 1 };
+        if len < header_len {
+            return (packet, 0);
+        }
+        let payload_header = unsafe { *buf.cast::<u8>().add(header_len - 1) };
+        if extended && payload_header == SPE_HEADER1_ALIGNMENT {
+            let alignment = 1usize << ((packet.hdr & 0xf) + 1);
+            let padding = alignment - (offset & (alignment - 1));
+            if len < padding {
+                return (packet, 0);
+            }
+            packet.pkt_type = ARM_SPE_PAD;
+            return (packet, padding);
+        }
+        let payload_len = 1usize << ((payload_header >> 4) & 3);
+        if len < header_len + payload_len {
+            return (packet, 0);
+        }
+
         if packet.hdr == SPE_HEADER0_TIMESTAMP {
             packet.pkt_type = ARM_SPE_TIMESTAMP;
             packet.get_payload();
@@ -196,7 +235,7 @@ impl Packet {
 
         if packet.hdr as u64 & SPE_HEADER0_MASK1 == SPE_HEADER0_EVENTS as u64 {
             packet.pkt_type = ARM_SPE_EVENTS;
-            packet.index = unsafe { *(buf.wrapping_add(packet.hdr_len as _) as *mut u8) as _ };
+            packet.index = packet.payload_len();
             packet.get_payload();
             let len = packet.size();
             return (packet, len);
@@ -232,16 +271,6 @@ impl Packet {
 
             packet.hdr_len = 2;
             packet.hdr = unsafe { *(buf.wrapping_add(1) as *mut u8) as _ };
-
-            if packet.hdr == SPE_HEADER1_ALIGNMENT {
-                panic!("fixme");
-                /*
-                                let alignment = 1 << ((packet.hdr & 0xf) + 1);
-                                assert!(len >= alignment);
-                                packet.pkt_type = ARM_SPE_PAD;
-                                return (packet, alignment - (buf as usize & (alignment - 1))); // FIXME
-                */
-            }
         }
 
         /*
@@ -278,5 +307,47 @@ impl Packet {
 
         return (packet, 1);
         //panic!("bad packet!");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waits_for_split_headers_and_payloads() {
+        for mut bytes in [
+            vec![0xb2u8, 1, 2, 3, 4, 5, 6, 7, 8],
+            vec![0x20u8, 0xb2, 1, 2, 3, 4, 5, 6, 7, 8],
+            vec![0x71u8, 1, 2, 3, 4, 5, 6, 7, 8],
+            vec![0x42u8, 8],
+        ] {
+            for len in 1..bytes.len() {
+                assert_eq!(Packet::decode_at(bytes.as_mut_ptr().cast(), len, 0).1, 0);
+            }
+            assert_eq!(
+                Packet::decode_at(bytes.as_mut_ptr().cast(), bytes.len(), 0).1,
+                bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_unaligned_little_endian_payloads() {
+        let mut bytes = [0u8, 0xb2, 1, 2, 3, 4, 5, 6, 7, 8];
+        let (packet, size) = Packet::decode_at(bytes.as_mut_ptr().wrapping_add(1).cast(), 9, 1);
+        assert!(matches!(packet.pkt_type, PacketType::ARM_SPE_ADDRESS));
+        assert_eq!(packet.index, 2);
+        assert_eq!(packet.payload, 0x0807_0605_0403_0201);
+        assert_eq!(size, 9);
+    }
+
+    #[test]
+    fn alignment_uses_stream_offset_after_copying() {
+        let mut bytes = [0x23u8, 0];
+        let (packet, size) = Packet::decode_at(bytes.as_mut_ptr().cast(), 2, 14);
+        assert!(matches!(packet.pkt_type, PacketType::ARM_SPE_PAD));
+        assert_eq!(size, 2);
+        assert_eq!(Packet::decode_at(bytes.as_mut_ptr().cast(), 2, 0).1, 0);
     }
 }

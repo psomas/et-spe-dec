@@ -9,6 +9,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     fmt, fs,
+    os::unix::fs::FileExt,
     process::Command,
     time::Instant,
 };
@@ -592,11 +593,12 @@ impl Profiler {
 
     fn scan_pagemap(&mut self) {
         let mut pagemap = PageMap::new(self.pid as _).unwrap();
-        let mut vmas: Vec<VirtualMemoryArea> = pagemap
+        let pagemap_file = fs::File::open(format!("/proc/{}/pagemap", self.pid)).unwrap();
+        let mut vmas: Vec<MemoryRegion> = pagemap
             .maps()
             .unwrap()
             .into_iter()
-            .map(|x| x.vma())
+            .map(|x| x.memory_region())
             .collect();
 
         /* sort vmas by size */
@@ -611,12 +613,22 @@ impl Profiler {
             let mut addr = start;
             while addr <= end {
                 let vpn = addr >> 12;
-                let entry = pagemap.pagemap_vpn(vpn).unwrap();
+                // Read one entry so huge-page jumps do not scan the entire VMA.
+                // Keep the raw bits, including the custom kernel's bits 59/60.
+                let mut buf = [0; 8];
+                pagemap_file.read_exact_at(&mut buf, vpn * 8).unwrap();
+                let entry = PageMapEntry::from(u64::from_ne_bytes(buf));
+                let flags = if entry.present() {
+                    match pagemap.kpageflags(entry.pfn().unwrap()) {
+                        Ok(flags) => flags,
+                        Err(PageMapError::Access(_)) => KPageFlags::empty(),
+                        Err(error) => panic!("reading /proc/kpageflags: {error}"),
+                    }
+                } else {
+                    KPageFlags::empty()
+                };
 
-                if !entry.present()
-                    || !entry.anon().unwrap_or(false)
-                    || !entry.thp().unwrap_or(false)
-                {
+                if !flags.contains(KPageFlags::KPF_ANON | KPageFlags::KPF_THP) {
                     addr += Size::Pte.bytes() as u64;
                     continue;
                 }

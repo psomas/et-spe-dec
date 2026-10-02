@@ -1,4 +1,7 @@
-use std::{arch::asm, fs};
+use std::fs;
+
+#[cfg(target_arch = "aarch64")]
+use std::arch::asm;
 
 use constcat::concat;
 use lazy_static::lazy_static;
@@ -36,9 +39,14 @@ lazy_static! {
         .parse()
         .unwrap();
     pub static ref CNTFRQ_EL0: u64 = {
-        let val: u64;
-        unsafe { asm!("mrs {}, cntfrq_el0", out(reg) val) };
-        val
+        #[cfg(target_arch = "aarch64")]
+        {
+            let val: u64;
+            unsafe { asm!("mrs {}, cntfrq_el0", out(reg) val) };
+            val
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        panic!("SPE timestamp conversion requires AArch64")
     };
 }
 
