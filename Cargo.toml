@@ -25,3 +25,7 @@ path = "src/tlb_sampler.rs"
 [[bin]]
 name="access_sampler"
 path = "src/access_sampler.rs"
+
+[[bin]]
+name="access_bench"
+path = "src/access_bench.rs"
